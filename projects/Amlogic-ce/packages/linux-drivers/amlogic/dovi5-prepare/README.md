@@ -34,6 +34,12 @@ ENABLE=no
 
 Preparation is ordered before the Dolby loader. The loader independently rechecks the current source, configuration, kernel/shim references, symbol versions, manifest and complete canonical output before loading the second module. `/run/dovi5-path` identifies a validated generation for that boot and cannot authorize an arbitrary file. Preparation and loader messages are available in the system journal.
 
+The prepared library also supports the default-off **Stabilize SDR subtitle and OSD brightness** option in Kodi's DV settings. Use it only if the TV's scene-dependent dimming of subtitles and the OSD is unwanted. It selects a neutral graphics forward curve before composition with the current video compensation; it does not freeze the final Core2 curves. Video processing, Core3 metadata and the SDR graphics peak input remain native. Disabling restores the native graphics policy.
+
+This option needs the paired driver and shim. The shim advertises `dv_graphics_stable_available` only when the registered library reports `[p3i-gfxref:2]`. Private reserved words at byte 19800 carry the request, retry and successful-generation acknowledgment. The driver retires a request only after Core2 receives its fresh curves; skipped transfers and current CONST decisions do not consume it. Unknown library versions leave the option unavailable.
+
+The transformation is pinned to the supplied source hash and a checked-in graphics helper profile. It preserves the vendor callback/CFI entries, stack checks, legacy ABI and all video mapping instructions. The helper's AArch64 source and profile generator are maintainer inputs; the installed preparation path needs no assembler. To update the profile, assemble `maintainer/graphics-reference.S`, run `maintainer/update-graphics-profile.py` on that object, and update the explicit profile hash in `scripts/dv5_graphics.py` after review.
+
 Successful preparation and loading establish software compatibility checks. CMv4 rendering, chroma quality, cadence and HDMI behavior still require acceptance testing on the paired image and display chain.
 
 For maintainers, tests contain synthetic references only. Supply the optional real module fixture outside the repository:

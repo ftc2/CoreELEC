@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 PKG_NAME="dovi5-prepare"
-PKG_VERSION="1"
+PKG_VERSION="2"
 PKG_LICENSE="GPL"
 PKG_SITE=""
 PKG_URL=""
@@ -13,6 +13,8 @@ makeinstall_target() {
   install -d "${INSTALL}/usr/lib/coreelec"
   install -m 0755 "${PKG_DIR}/scripts/dovi5_prepare.py" "${INSTALL}/usr/lib/coreelec/dovi5-prepare"
   install -m 0644 "${PKG_DIR}/scripts/dv5_patch.py" "${INSTALL}/usr/lib/coreelec/dv5_patch.py"
+  install -m 0644 "${PKG_DIR}/scripts/dv5_graphics.py" "${INSTALL}/usr/lib/coreelec/dv5_graphics.py"
+  install -m 0644 "${PKG_DIR}/scripts/graphics-profile.json" "${INSTALL}/usr/lib/coreelec/graphics-profile.json"
   install -m 0644 "${PKG_DIR}/scripts/canary-profile.json" "${INSTALL}/usr/lib/coreelec/canary-profile.json"
   local dovi5_kernel_install
   dovi5_kernel_install=$(get_install_dir linux)

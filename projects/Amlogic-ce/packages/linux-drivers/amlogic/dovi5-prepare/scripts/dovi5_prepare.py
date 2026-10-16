@@ -77,6 +77,8 @@ def context(root, ref=None, versions=None, ksyms=None, release=None):
     manifest = dict(source=digest(source), reference=digest(reference), kernel_release=release,
                     versions=digest(symvers), kernel_exports=digest('\n'.join(sorted(exports)).encode('ascii')),
                     patcher=digest(read_regular(Path(__file__).with_name('dv5_patch.py'))),
+                    graphics=digest(read_regular(Path(__file__).with_name('dv5_graphics.py'))),
+                    graphics_profile=digest(read_regular(Path(__file__).with_name('graphics-profile.json'))),
                     preparation=digest(read_regular(Path(__file__))), profile=digest(profile_data), output=digest(result))
     manifest_bytes = (json.dumps(manifest, sort_keys=True) + '\n').encode('ascii')
     generation = root / 'storage/.dovi5/generations' / digest(manifest_bytes)

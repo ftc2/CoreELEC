@@ -422,6 +422,12 @@ def canonical(source, reference, symvers_data, exports, profile):
         if sym['index'] == elf.byname['__versions']['index'] and sym['size']:
             require(sym['value'] == 0, 'unexpected version section object offset')
             sym['size'] = len(elf.byname['__versions']['data'])
+    # Reparse after the canary transformation: the parsed relocation lists still
+    # describe the source until encoding, and must not replace the new guards.
+    from dv5_graphics import apply_graphics
+    elf = ELF(elf.encode())
+    apply_graphics(elf, read_regular(Path(__file__).with_name('graphics-profile.json')),
+                   require, RELA)
     result = elf.encode()
     checked = ELF(result)
     require(checked.imports() == imports and checked.versions().keys() == imports | {'module_layout'}, 'canonical output imports/versions incomplete')

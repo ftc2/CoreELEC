@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -44,6 +45,16 @@ if LOADER is None:
             LOADER = candidate
             break
 PROFILE = json.loads((SCRIPTS / 'canary-profile.json').read_bytes())
+GRAPHICS_PROFILE = json.loads((SCRIPTS / 'graphics-profile.json').read_bytes())
+GRAPHICS_SITES = {0x3af0: 'p3i_entry', 0xba30: 'p3i_ba30',
+                  0xbdd8: 'p3i_bdd8', 0xc1a0: 'p3i_concat_done',
+                  0x515c: 'p3i_cp_done'}
+GRAPHICS_CAPABILITY = b' %s %s%s [p3i-gfxref:2]\0'
+RUNTIME_FILES = {'dv5_patch.py': 'dv5_patch.py',
+                 'dovi5_prepare.py': 'dovi5-prepare',
+                 'dv5_graphics.py': 'dv5_graphics.py',
+                 'canary-profile.json': 'canary-profile.json',
+                 'graphics-profile.json': 'graphics-profile.json'}
 SHIM_EXPORTS = {'register_dv5shim_func', 'unregister_dv5shim_func', 'dv5_stack_chk_guard',
                 'get_cpu_type_from_media', '_printk', '__cfi_slowpath_diag',
                 '__ubsan_handle_cfi_check_fail_abort', '__stack_chk_fail'}
@@ -198,8 +209,16 @@ class ExactBlob(unittest.TestCase):
         self.assertEqual(set(out.versions()), out.imports() | {'module_layout'})
         self.assertNotIn('register_dv_functions', out.imports())
         self.assertIn(p.GUARD, out.imports())
-        for name in ('.bss', '.data', '.rodata', '.init.text', '.exit.text'):
+        original = p.ELF(self.source)
+        for name in ('.bss', '.data', '.init.text', '.exit.text'):
             self.assertEqual(out.byname[name]['data'], p.ELF(self.source).byname[name]['data'])
+        self.assertEqual(out.byname['.rodata']['data'],
+                         original.byname['.rodata']['data'] + GRAPHICS_CAPABILITY)
+        self.assertEqual(out.byname['.bss']['size'],
+                         ((original.byname['.bss']['size'] + 7) & ~7) + 32)
+        for name in ('multi_control_path', 'metadata_parser_init', 'metadata_parser_reset',
+                     'metadata_parser_process', 'metadata_parser_release'):
+            self.assertEqual(out.symbol(name)[1]['value'], original.symbol(name)[1]['value'])
 
     def test_canonical_preserves_repeated_descriptive_records_and_symbol_offsets(self):
         elf = p.ELF(self.source)
@@ -240,7 +259,110 @@ class ExactBlob(unittest.TestCase):
             struct.pack_into('<I', expected_text, b, oldb & ~(4095 << 10))
             self.assertIn((a, guard_index, 275, 0), actual)
             self.assertIn((b, guard_index, 286, 0), actual)
+        for offset in GRAPHICS_SITES:
+            struct.pack_into('<I', expected_text, offset, 0x14000000)
+        start = (len(expected_text) + 15) & ~15
+        expected_text.extend(bytes(start - len(expected_text)))
+        expected_text.extend(bytes.fromhex(GRAPHICS_PROFILE['text']))
         self.assertEqual(out.byname['.text']['data'], expected_text)
+
+    def test_graphics_relocations_and_capability_are_exact(self):
+        original, out = p.ELF(self.source), p.ELF(self.result)
+        text_index = out.byname['.text']['index']
+        bss_index = out.byname['.bss']['index']
+        text_symbol = next(i for i, s in enumerate(out.symbols)
+                           if s['index'] == text_index and s['info'] == 3)
+        bss_symbol = next(i for i, s in enumerate(out.symbols)
+                          if s['index'] == bss_index and s['info'] == 3)
+        start = (len(original.byname['.text']['data']) + 15) & ~15
+        state = (original.byname['.bss']['size'] + 7) & ~7
+        labels = {name: start + value['offset']
+                  for name, value in GRAPHICS_PROFILE['labels'].items()}
+        references = {name: (text_symbol, off) for name, off in labels.items()}
+        references.update({'p3i_state': (bss_symbol, state),
+                           'p3i_resume_cp': (text_symbol, 0x3af4),
+                           'p3i_resume_ba30': (text_symbol, 0xba34),
+                           'p3i_taken_ba30': (text_symbol, 0xbad0),
+                           'p3i_resume_bdd8': (text_symbol, 0xbddc),
+                           'p3i_taken_bdd8': (text_symbol, 0xc29c),
+                           'p3i_resume_concat': (text_symbol, 0xc1a4),
+                           'p3i_resume_done': (text_symbol, 0x5160),
+                           'CreateToneCurve': (out.symbol('CreateToneCurve')[0], 0)})
+        expected = list(original.relocations[text_index][1])
+        expected.remove((0xc184, original.symbol('CreateToneCurve')[0], 283, 0))
+        expected.append((0xc184, text_symbol, 283, labels['p3i_curve']))
+        expected.extend((off, text_symbol, 282, labels[name])
+                        for off, name in GRAPHICS_SITES.items())
+        for r in GRAPHICS_PROFILE['relocations']:
+            symbol, addend = references[r['symbol']]
+            expected.append((start + r['offset'], symbol, r['type'], addend + r['addend']))
+        guard_index = out.symbol(p.GUARD)[0]
+        for pair in PROFILE:
+            expected.extend(((pair['adrp_text_offset'], guard_index, 275, 0),
+                             (pair['ldr_text_offset'], guard_index, 286, 0)))
+        self.assertEqual(out.relocations[text_index][1], sorted(expected))
+        original_init = original.relocations[original.byname['.init.text']['index']][1]
+        expected_init = [(off, sym, typ, len(original.byname['.rodata']['data'])
+                          if off in (0xb0, 0xb4) else add)
+                         for off, sym, typ, add in original_init]
+        self.assertEqual(out.relocations[out.byname['.init.text']['index']][1], expected_init)
+        for name, value in GRAPHICS_PROFILE['labels'].items():
+            _, symbol = out.symbol(name)
+            self.assertEqual((symbol['index'], symbol['value'], symbol['size']),
+                             (text_index, labels[name], value['size']))
+        _, symbol = out.symbol('p3i_state')
+        self.assertEqual((symbol['index'], symbol['value'], symbol['size']),
+                         (bss_index, state, 32))
+
+    def test_graphics_source_instruction_and_relocation_mismatches_reject(self):
+        for kind in ('instruction', 'curve_call', 'version_format', 'version_relocation'):
+            with self.subTest(kind=kind):
+                elf = p.ELF(self.source)
+                if kind == 'instruction':
+                    data = bytearray(elf.byname['.text']['data'])
+                    struct.pack_into('<I', data, 0x3af0, 0xd503201f)
+                    elf.byname['.text']['data'] = bytes(data)
+                elif kind == 'version_format':
+                    data = bytearray(elf.byname['.rodata']['data'])
+                    data[0x14a9] ^= 1
+                    elf.byname['.rodata']['data'] = bytes(data)
+                else:
+                    section = '.text' if kind == 'curve_call' else '.init.text'
+                    relsec, records = elf.relocations[elf.byname[section]['index']]
+                    offset = 0xc184 if kind == 'curve_call' else 0xb0
+                    relsec['data'] = b''.join(p.RELA.pack(off, (sym << 32) | typ,
+                                                        add + (off == offset))
+                                                for off, sym, typ, add in records)
+                changed = elf.encode()
+                # Exercise profile guards after the normal exact-source gate;
+                # this altered source is admitted only within this test.
+                with patch.object(p, 'SOURCE_SHA', p.digest(changed)):
+                    with self.assertRaises(p.Rejected):
+                        p.canonical(changed, REF, VERSIONS, KERNEL_EXPORTS, PROFILE)
+
+    def test_graphics_prepared_payload_and_relocations_cannot_be_modified(self):
+        for kind in ('payload', 'hook', 'relocation', 'capability', 'state_size'):
+            with self.subTest(kind=kind):
+                elf = p.ELF(self.result)
+                if kind in ('payload', 'hook'):
+                    data = bytearray(elf.byname['.text']['data'])
+                    offset = elf.symbol('p3i_entry')[1]['value'] if kind == 'payload' else 0xba30
+                    data[offset] ^= 1
+                    elf.byname['.text']['data'] = bytes(data)
+                elif kind == 'capability':
+                    data = bytearray(elf.byname['.rodata']['data'])
+                    data[-3] ^= 1
+                    elf.byname['.rodata']['data'] = bytes(data)
+                elif kind == 'state_size':
+                    elf.byname['.bss']['size'] += 8
+                else:
+                    relsec, records = elf.relocations[elf.byname['.text']['index']]
+                    relsec['data'] = b''.join(p.RELA.pack(off, (sym << 32) | typ,
+                                                        add + (4 if off == 0xba30 else 0))
+                                                for off, sym, typ, add in records)
+                with self.assertRaises(p.Rejected):
+                    p.validate_prepared(self.source, elf.encode(), REF, VERSIONS,
+                                        KERNEL_EXPORTS, PROFILE)
 
     def test_complete_canonical_validation_rejects_modified_payload(self):
         args = (self.source, self.result, REF, VERSIONS, KERNEL_EXPORTS, PROFILE)
@@ -360,6 +482,65 @@ class ExactBlob(unittest.TestCase):
             rejected = subprocess.run(command + ['validate'] + options, capture_output=True)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertEqual(output.read_bytes(), self.result)
+
+    def test_flat_installed_runtime_and_graphics_profile_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            installed_scripts = root / 'installed'; installed_scripts.mkdir()
+            # Mirror the deployed names, including the extensionless entry point.
+            for source, installed in RUNTIME_FILES.items():
+                shutil.copyfile(SCRIPTS / source, installed_scripts / installed)
+            package = HERE.parent / 'package.mk'
+            if package.is_file():
+                recipe = package.read_text()
+                for source, installed in RUNTIME_FILES.items():
+                    self.assertIn('"${PKG_DIR}/scripts/' + source + '"', recipe)
+                    self.assertIn('"${INSTALL}/usr/lib/coreelec/' + installed + '"', recipe)
+            args, installed_ref, _, environment = self.overlay_reference_fixture(root / 'target')
+            elsewhere = root / 'elsewhere'; elsewhere.mkdir()
+            environment = dict(os.environ, **environment)
+            environment.pop('PYTHONPATH', None)
+            command = [sys.executable, str(installed_scripts / 'dovi5-prepare')]
+            options = ['--root', str(args[0]), '--versions', str(args[2]),
+                       '--ksyms', str(args[3]), '--kernel-release', args[4]]
+            subprocess.run(command + ['prepare'] + options, cwd=elsewhere,
+                           env=environment, check=True, capture_output=True)
+            accepted = subprocess.run(command + ['validate-load'] + options, cwd=elsewhere,
+                                      env=environment, check=True, capture_output=True, text=True)
+            output = Path(accepted.stdout.strip())
+            self.assertEqual(output.read_bytes(), self.result)
+            stamp = json.loads(output.with_name('state.json').read_bytes())
+            self.assertEqual(stamp['graphics'], p.digest((installed_scripts / 'dv5_graphics.py').read_bytes()))
+            self.assertEqual(stamp['graphics_profile'], p.digest((installed_scripts / 'graphics-profile.json').read_bytes()))
+            standalone = root / 'standalone.ko'
+            patch_command = [sys.executable, str(installed_scripts / 'dv5_patch.py')]
+            patch_options = [str(args[0] / 'storage/.config/dovi5.ko'), str(standalone),
+                             '--ref', str(installed_ref), '--versions', str(args[2]),
+                             '--ksyms', str(args[3])]
+            for operation in ('patch', 'validate'):
+                subprocess.run(patch_command + [operation] + patch_options, cwd=elsewhere,
+                               env=environment, check=True, capture_output=True)
+            self.assertEqual(standalone.read_bytes(), self.result)
+            profile_path = installed_scripts / 'graphics-profile.json'
+            original_profile = profile_path.read_bytes()
+            marker = args[0] / 'run/dovi5-path'
+            for failure in ('missing', 'corrupt'):
+                with self.subTest(failure=failure):
+                    if failure == 'missing':
+                        profile_path.unlink()
+                    else:
+                        changed = json.loads(original_profile)
+                        changed['text'] = ('0' if changed['text'][0] != '0' else '1') + changed['text'][1:]
+                        profile_path.write_text(json.dumps(changed))
+                    rejected = subprocess.run(command + ['validate-load'] + options, cwd=elsewhere,
+                                              env=environment, capture_output=True)
+                    self.assertNotEqual(rejected.returncode, 0)
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(output.read_bytes(), self.result)
+                    self.assertEqual((args[0] / 'storage/.config/dovi5.ko').read_bytes(), self.source)
+                    profile_path.write_bytes(original_profile)
+                    subprocess.run(command + ['prepare'] + options, cwd=elsewhere,
+                                   env=environment, check=True, capture_output=True)
 
     def test_installed_reference_failures_retain_legacy_and_source(self):
         for kind in ('broken', 'loop', 'directory', 'fifo', 'identity', 'release', 'malformed'):
@@ -490,6 +671,8 @@ class ActualReference(unittest.TestCase):
                                     versions=str(fixture_args.versions), versions_sha256=p.digest(versions),
                                     exports_source=str(fixture_args.exports), exports_sha256=p.digest(export_bytes),
                                     source_sha256=p.digest(source), profile_sha256=p.digest((SCRIPTS / 'canary-profile.json').read_bytes()),
+                                    graphics_sha256=p.digest((SCRIPTS / 'dv5_graphics.py').read_bytes()),
+                                    graphics_profile_sha256=p.digest((SCRIPTS / 'graphics-profile.json').read_bytes()),
                                     native_module_size=size, name_offset=offset, name_size=length, relocations=entries,
                                     metadata_counts={k.decode('ascii'): len(v) for k, v in ref.module_info().items()},
                                     output_size=len(expected), output_sha256=p.digest(expected), prepare=True, validate_load=True,
